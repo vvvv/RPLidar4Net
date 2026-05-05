@@ -434,8 +434,10 @@ namespace RPLidar4Net.IO
                 byte[] data = _serialPort.Read((int)responseLength, timeout);
                 return data;
             }
-            catch
+            catch (Exception e)
             {
+                Log.Error(e, "Read()");
+                Console.WriteLine("Error in Read(): " + e.Message);
                 //Set connection status
                 this._isConnected = false;
                 //Then go through the motions
@@ -495,6 +497,8 @@ namespace RPLidar4Net.IO
             }
             catch (Exception e)
             {
+                Log.Error(e, "ReadScanDataResponseBytes()");
+                Console.WriteLine("Error in ReadScanDataResponseBytes(): " + e.Message);
                 //Set connection status
                 this._isConnected = false;
                 //Then go through the motions
