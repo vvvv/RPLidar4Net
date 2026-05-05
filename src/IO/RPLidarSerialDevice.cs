@@ -34,6 +34,11 @@ namespace RPLidar4Net.IO
         private bool _motorRunning;
 
         /// <summary>
+        /// Indicates the type of support for motor control
+        /// </summary>
+        private MotorControlSupport _motorControlSupport;
+
+        /// <summary>
         /// Scanning Status
         /// </summary>
         private bool _isScanning;
@@ -52,6 +57,8 @@ namespace RPLidar4Net.IO
                 RaiseMotorSpeedChanged();
             }
         }
+
+        public bool IsConnected => _isConnected;
 
         public event EventHandler MotorSpeedChanged;
 
@@ -113,6 +120,7 @@ namespace RPLidar4Net.IO
                 _serialPort.Open();
                 this._isConnected = true;
                 Console.WriteLine("Connected to RPLidar on {0}", _serialPort.PortName);
+                _motorControlSupport = CheckMotorControlSupport();
             }
         }
         /// <summary>
@@ -214,6 +222,18 @@ namespace RPLidar4Net.IO
             if (_isConnected)
             {
                 _serialPort.DtrEnable = false;
+
+                if (_motorControlSupport != MotorControlSupport.None)
+                {
+                    var desiredFreq = GetDesiredRotationFrequency();
+
+                    switch (_motorControlSupport)
+                    {
+                        case MotorControlSupport.RPM: SendRequest(Command.MotorSpeedControl, BitConverter.GetBytes(desiredFreq.DesiredRotationFrequencyRPM), true); break;
+                        case MotorControlSupport.PWM: SendRequest(Command.SetMotorPWM, BitConverter.GetBytes(desiredFreq.DesiredRotationFrequencyPWM), true); break;
+                    }
+                }
+
                 _motorRunning = true;
             }
         }
@@ -224,6 +244,11 @@ namespace RPLidar4Net.IO
         {
             if (_isConnected)
             {
+                switch (_motorControlSupport)
+                {
+                    case MotorControlSupport.RPM: SendRequest(Command.MotorSpeedControl, new byte[2] { 0x00, 0x00 }, true); break;
+                    case MotorControlSupport.PWM: SendRequest(Command.SetMotorPWM, new byte[2] { 0x00, 0x00 }, true); break;
+                }
                 _serialPort.DtrEnable = true;
                 _motorRunning = false;
             }
@@ -243,7 +268,6 @@ namespace RPLidar4Net.IO
         public InfoDataResponse GetInfo()
         {
             return (InfoDataResponse)this.SendRequest(Command.GetInfo);
-
         }
         /// <summary>
         /// Get Device Health Status
@@ -251,6 +275,13 @@ namespace RPLidar4Net.IO
         public HealthDataResponse GetHealth()
         {
             return (HealthDataResponse)this.SendRequest(Command.GetHealth);
+        }
+        /// <summary>
+        /// Get desired rotation frequency
+        /// </summary>
+        public LidarConfigDataResponse GetDesiredRotationFrequency()
+        {
+            return (LidarConfigDataResponse)this.SendRequest(Command.GetLidarConf, CommandHelper.GetLidarConfigPayload(LidarConfigType.DesiredRotationFrequency));
         }
         /// <summary>
         /// Get number of ScanModes via Lidar Conf
@@ -339,7 +370,7 @@ namespace RPLidar4Net.IO
             if (this._isScanning)
             {
                 //Avoid thread lock with main thread/gui
-                Thread myThread = new System.Threading.Thread(delegate()
+                Thread myThread = new System.Threading.Thread(delegate ()
                 {
                     this._isScanning = false;
                     _scanThread.Join();
@@ -364,8 +395,10 @@ namespace RPLidar4Net.IO
                 byte[] data = _serialPort.Read((int)responseLength, timeout);
                 return data;
             }
-            catch
+            catch (Exception e)
             {
+                Log.Error(e, "Read()");
+                Console.WriteLine("Error in Read(): " + e.Message);
                 //Set connection status
                 this._isConnected = false;
                 //Then go through the motions
@@ -410,7 +443,7 @@ namespace RPLidar4Net.IO
                     }
                 }
             }
-            catch
+			catch
             {
                 //Set connection status
                 this._isConnected = false;
@@ -468,6 +501,35 @@ namespace RPLidar4Net.IO
                     yield return ScanDataResponseHelper.ToPoint(ScanDataResponseHelper.ToScanDataResponse(_responseBytes));
                 }
             }
+        }
+        
+        private enum MotorControlSupport { None, PWM, RPM };
+        private MotorControlSupport CheckMotorControlSupport()
+        {
+            if (_isConnected)
+            {
+                var deviceInfo = GetInfo();
+                byte.TryParse(deviceInfo.ModelID, out var modelId);
+                var majorId = modelId >> 4;
+                if (majorId >= Constants.BUILTIN_MOTORCTL_MINUM_MAJOR_ID)
+                    return MotorControlSupport.RPM;
+                else if (majorId >= Constants.A2A3_LIDAR_MINUM_MAJOR_ID)
+                {
+                    try
+                    {
+                        var accBoardDataResponse = (AccBoardDataResponse)SendRequest(Command.GetAccBoardFlag, new byte[4] {0,0,0,0});
+                        if (accBoardDataResponse.IsSupported)
+                            return MotorControlSupport.PWM;
+                    }
+                    catch 
+                    {
+                        //special case for C1 that does actually have motorcontrol but does not correctly answer the AccBoardFlag request
+                        return MotorControlSupport.PWM;
+                    }
+                }
+            }
+
+            return MotorControlSupport.None;
         }
     }
 }
