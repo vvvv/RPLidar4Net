@@ -519,9 +519,17 @@ namespace RPLidar4Net.IO
                     return MotorControlSupport.RPM;
                 else if (majorId >= Constants.A2A3_LIDAR_MINUM_MAJOR_ID)
                 {
-                    var accBoardDataResponse = (AccBoardDataResponse)SendRequest(Command.GetAccBoardFlag, new byte[4] {0,0,0,0});
-                    if (accBoardDataResponse.IsSupported)
+                    try
+                    {
+                        var accBoardDataResponse = (AccBoardDataResponse)SendRequest(Command.GetAccBoardFlag, new byte[4] {0,0,0,0});
+                        if (accBoardDataResponse.IsSupported)
+                            return MotorControlSupport.PWM;
+                    }
+                    catch 
+                    {
+                        //special case for C1 that does actually have motorcontrol but does not correctly answer the AccBoardFlag request
                         return MotorControlSupport.PWM;
+                    }
                 }
             }
 
