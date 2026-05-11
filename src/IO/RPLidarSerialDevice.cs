@@ -23,6 +23,8 @@ namespace RPLidar4Net.IO
 
         private readonly int _readWriteTimeout;
 
+        private CancellationTokenSource _cts = new CancellationTokenSource();
+
         /// <summary>
         /// Connection Status
         /// </summary>
@@ -130,7 +132,6 @@ namespace RPLidar4Net.IO
         {
             if (_serialPort != null)
             {
-
                 //Stop scan
                 if (_isScanning)
                 {
@@ -237,6 +238,7 @@ namespace RPLidar4Net.IO
                 _motorRunning = true;
             }
         }
+
         /// <summary>
         /// Stop RPLidar Motor
         /// </summary>
@@ -351,7 +353,7 @@ namespace RPLidar4Net.IO
                     //Start Scan
                     this.SendRequest(Command.ForceScan);
                     //Start Scan read thread
-                    _scanThread = new Thread(ScanThread);
+                    _scanThread = new Thread(() => ScanThread(_cts.Token));
                     _scanThread.Start();
                 }
             }
@@ -371,10 +373,19 @@ namespace RPLidar4Net.IO
                     //Motor must be running
                     if (!_motorRunning)
                         this.StartMotor();
+
+                    //Clear input buffer of any junk
+                    _serialPort.DiscardInBuffer();
+                    _serialPort.SendRequest(Command.ExpressScan, CommandHelper.GetExpressScanPayload(0), true);
+                    ResponseDescriptor responseDescriptor = ReadResponseDescriptor();
                     //Start Scan
-                    this.SendRequest(Command.Scan);
+                    switch (responseDescriptor.DataType)
+                    {
+                        case DataType.LegacyExpressScan: _scanThread = new Thread(() => LegacyExpressScanThread(_cts.Token)); break;
+                        case DataType.DenseCapsule: _scanThread = new Thread(() => DenseScanThread(_cts.Token)); break;
+                        default: _scanThread = new Thread(() => ScanThread(_cts.Token)); break;
+                    }
                     //Start Scan read thread
-                    _scanThread = new Thread(ScanThread);
                     _scanThread.Start();
                 }
             }
@@ -386,8 +397,10 @@ namespace RPLidar4Net.IO
         {
             if (this._isScanning)
             {
+                _cts.Cancel();
+
                 //Avoid thread lock with main thread/gui
-                Thread myThread = new System.Threading.Thread(delegate ()
+                Thread myThread = new Thread(delegate ()
                 {
                     this._isScanning = false;
                     _scanThread.Join();
@@ -395,6 +408,8 @@ namespace RPLidar4Net.IO
                 });
                 myThread.Start();
                 myThread.Join();
+
+                _cts = new CancellationTokenSource();
                 return;
             }
         }
@@ -458,7 +473,7 @@ namespace RPLidar4Net.IO
         /// Thread used for scanning
         /// Populates a list of Measurements, and adds that list to 
         /// </summary>
-        public void ScanThread()
+        public void ScanThread(CancellationToken ct)
         {
             DateTime lastStartFlagDateTime = new DateTime();
             var fullScan = new List<Point>();
@@ -467,7 +482,7 @@ namespace RPLidar4Net.IO
             try
             {
                 //Loop while we're scanning
-                while (this._isScanning)
+                while (this._isScanning && !ct.IsCancellationRequested)
                 {
                     var newPoints = ReadScanDataResponses();
 
@@ -545,6 +560,150 @@ namespace RPLidar4Net.IO
                 {
                     _responseBytePos = 0;
                     yield return ScanDataResponseHelper.ToPoint(ScanDataResponseHelper.ToScanDataResponse(_responseBytes));
+                }
+            }
+        }
+
+        private void LegacyExpressScanThread(CancellationToken ct)
+        {
+            var rawBuf = new byte[Protocol.EXPRESS_CAPSULE_SIZE];
+            var pending = new List<Point>(5500);
+            bool hasPrev = false;
+            bool needRead = true; // false while re-syncing byte-by-byte
+            Protocol.LegacyExpressCapsule prev = default;
+
+            // Re-use a scratch list to avoid per-capsule allocation inside the hot path.
+            var measurements = new List<Protocol.Measurement>(32);
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    if (needRead)
+                    {
+                        rawBuf = Read((uint)rawBuf.Length, _readWriteTimeout);
+                        if (ct.IsCancellationRequested) break;
+                    }
+                    needRead = true; // default: fetch a fresh capsule next iteration
+
+                    var curr = Protocol.ParseExpressCapsule(rawBuf);
+                    if (!curr.Valid)
+                    {
+                        // Sync lost — shift 1 byte and fill the tail with one new byte, then
+                        // retry parsing WITHOUT calling ReadExact (needRead stays false).
+                        Array.Copy(rawBuf, 1, rawBuf, 0, rawBuf.Length - 1);
+                        rawBuf[rawBuf.Length - 1] = (byte)_serialPort.ReadByte();
+                        hasPrev = false; // reset capsule pair — need fresh aligned pair
+                        needRead = false;
+                        continue;
+                    }
+
+                    // Need two consecutive capsules to decode angles.
+                    if (!hasPrev)
+                    {
+                        prev = curr;
+                        hasPrev = true;
+                        continue;
+                    }
+
+                    measurements.Clear();
+                    Protocol.DecodeLegacyExpressCapsulePair(in prev, in curr, measurements);
+
+                    // Primary: flush on revolution boundary.
+                    // IsNewScan header bit is the canonical signal; also catch wrap-around
+                    // geometrically (start angle drops by > 180°) for firmware that doesn't
+                    // set the bit reliably.
+                    bool angleWrap = curr.StartAngleDeg < prev.StartAngleDeg - 180f;
+                    bool flushNow = (curr.IsNewScan || prev.IsNewScan || angleWrap) && pending.Count > 0;
+                    // Fallback: publish if a full revolution's worth of points accumulates
+                    // without triggering the primary condition (~32 meas/capsule × ~42 caps/rev).
+                    bool flushFallback = pending.Count >= 1500;
+                    if (flushNow || flushFallback)
+                    {
+                        RaiseNewScan(pending);
+                        pending.Clear();
+                    }
+
+                    prev = curr;
+
+                    foreach (var m in measurements)
+                    {
+                        pending.Add(new Point() { Angle = m.Angle, Distance = m.Distance, Quality = m.Quality, StartFlag = m.IsNewScan });
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine("Error in LegacyExpressScanThread(): " + e.Message);
+                    break;
+                }
+            }
+        }
+
+        private void DenseScanThread(CancellationToken ct)
+        {
+            var rawBuf = new byte[Protocol.EXPRESS_CAPSULE_SIZE]; // 84 bytes, same size
+            var pending = new List<Point>(5500);
+            bool hasPrev = false;
+            bool needRead = true;
+            Protocol.DenseCapsule prev = default;
+
+            var measurements = new List<Protocol.Measurement>(40);
+
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    if (needRead)
+                    {
+                        rawBuf = Read((uint)rawBuf.Length, _readWriteTimeout);
+                        if (ct.IsCancellationRequested) break;
+                    }
+                    needRead = true;
+
+                    var curr = Protocol.ParseDenseCapsule(rawBuf);
+                    if (!curr.Valid)
+                    {
+                        Array.Copy(rawBuf, 1, rawBuf, 0, rawBuf.Length - 1);
+                        rawBuf[rawBuf.Length - 1] = (byte)_serialPort.ReadByte();
+                        hasPrev = false;
+                        needRead = false;
+                        continue;
+                    }
+
+                    if (!hasPrev)
+                    {
+                        prev = curr;
+                        hasPrev = true;
+                        continue;
+                    }
+
+                    measurements.Clear();
+                    Protocol.DecodeDenseCapsulePair(in prev, in curr, measurements);
+
+                    // In dense capsule format the IsNewScan header bit signals an encoder
+                    // reset (per Slamtec SDK), not a revolution boundary. Use angle wrap-around
+                    // instead: when the new capsule's start angle is more than 180° behind the
+                    // previous one the sensor has completed a revolution.
+                    bool angleWrap = curr.StartAngleDeg < prev.StartAngleDeg - 180f;
+                    bool flushNow = angleWrap && pending.Count > 0;
+                    bool flushFallback = pending.Count >= 1500;
+                    if (flushNow || flushFallback)
+                    {
+                        RaiseNewScan(pending);
+                        pending.Clear();
+                    }
+
+                    prev = curr;
+
+                    foreach (var m in measurements)
+                    {
+                        pending.Add(new Point() { Angle = m.Angle, Distance = m.Distance, Quality = m.Quality, StartFlag = m.IsNewScan });
+                    }
+                }
+                catch (Exception e)
+                {
+                    Console.WriteLine("Error in LegacyExpressScanThread(): " + e.Message);
+                    break;
                 }
             }
         }

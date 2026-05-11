@@ -4,6 +4,9 @@
     {
         // SCAN (p. 14)
         Scan = 0x81,
+        LegacyExpressScan = 0x82, //mentioned in LR001 2021-02-25 rev.2.2 (omitted in later versions of the pdf)
+        ExpressScan = 0x84, 
+        DenseCapsule = 0x85,
         // GET_INFO (p. 33)
         GetInfo = 0x04,
         // GET_HEALTH (p.35)

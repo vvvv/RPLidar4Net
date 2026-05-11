@@ -37,5 +37,10 @@ namespace RPLidar4Net.Api.Helpers
             else
                 return commandBytes.Reverse().Concat(modeBytes).Reverse().ToArray();
         }
+
+        public static byte[] GetExpressScanPayload(byte scanMode, UInt16 options = 0)
+        {
+            return new byte[1] { scanMode }.Concat(BitConverter.GetBytes(options)).Concat(new byte[2]).ToArray();
+        }
     }
 }
