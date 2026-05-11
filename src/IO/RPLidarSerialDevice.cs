@@ -166,12 +166,11 @@ namespace RPLidar4Net.IO
         {
             if (_isConnected)
             {
-                //Clear input buffer of any junk
-                _serialPort.DiscardInBuffer();
+                bool hasResponse = CommandHelper.GetHasResponse(command);
+                if (hasResponse) //Clear input buffer of any junk
+                    _serialPort.DiscardInBuffer();
 
                 _serialPort.SendRequest(command, payload, includePayloadSize);
-
-                bool hasResponse = CommandHelper.GetHasResponse(command);
 
                 //We must sleep after executing some commands
                 bool sleep = CommandHelper.GetMustSleep(command);
